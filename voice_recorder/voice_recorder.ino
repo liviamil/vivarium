@@ -6,22 +6,29 @@
 
 #define MIC_PIN A0
 #define BUTTON_PIN 26
-#define LED_PIN 24
+#define LED_PIN 40
 #define SD_CS_PIN 32
+
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
+
+#define FILTER_SIZE 10
+#define NOISE_THRESHOLD 3
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+int filterBuffer[FILTER_SIZE];
+int filterIndex = 0;
+int actualDCBias = 0;
 
 File audioFile;
 bool isRecording = false;
-bool lastButtonState = HIGH;
+bool lastButtonState = LOW;
 unsigned long lastDebounceTime = 0;
 unsigned long debounceDelay = 50;
 unsigned long sampleTimer = 0;
 unsigned long sampleInterval = 125; // 125 microseconds = 8000 Hz (standard audio rate)
 unsigned long totalSamples = 0;
-
 
 const unsigned char epd_bitmap_happy [] PROGMEM = {
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
@@ -240,107 +247,108 @@ bool showingHappy = true;
 bool showingSad = false;
 bool showingAngry = false;
 
-void setup() {
-  pinMode(MIC_PIN, INPUT);
-  pinMode(BUTTON_PIN, INPUT);
-  pinMode(LED_PIN, OUTPUT);
-  Serial.begin(115200);
-  
-  if (!SD.begin(SD_CS_PIN)) {
-      Serial.println("SD Card initialization failed!");
-      return;
-  }
-  Serial.println("SD Card ready.");
+// Generate a unique filename for the WAV file
+String getNextAvailableFileName() {
+  int index = 1;
+  String path;
 
+  // Make sure AUDIO directory exists
+  if (!SD.exists("/AUDIO")) {
+    if (SD.mkdir("/AUDIO")) {
+      Serial.println("Created AUDIO directory");
+    } else {
+      Serial.println("Failed to create AUDIO directory");
+      return "/audio.wav"; // Fallback filename
+    }
+  }
+
+  while (true) {
+    path = "/AUDIO/audio" + String(index) + ".wav";
+    if (!SD.exists(path.c_str())) {
+      return path;
+    }
+    index++;
+    
+    // Safety measure to prevent infinite loops
+    if (index > 9999) {
+      return "/AUDIO/audioOVF.wav";
+    }
+  }
+}
+
+void calibrateDCBias() {
+    Serial.println("Starting DC bias calibration...");
+    long sum = 0;
+    int samples = 100;
+    int minVal = 1023, maxVal = 0;
+
+    for (int i = 0; i < samples; i++) {
+        int val = analogRead(MIC_PIN);
+        sum += val;
+        if (val < minVal) minVal = val;
+        if (val > maxVal) maxVal = val;
+        delay(5);
+    }
+
+    actualDCBias = sum / samples;
+    Serial.print("DC Bias calibrated to: ");
+    Serial.print(actualDCBias);
+    Serial.print(" (min: ");
+    Serial.print(minVal);
+    Serial.print(", max: ");
+    Serial.print(maxVal);
+    Serial.println(")");
+}
+
+void testMicrophone() {
+    Serial.println("Testing microphone for 5 seconds...");
+    int min = 1023, max = 0;
+    unsigned long startTime = millis();
+    
+    while (millis() - startTime < 5000) {
+        int val = analogRead(MIC_PIN);
+        if (val < min) min = val;
+        if (val > max) max = val;
+        
+        Serial.print("Mic: ");
+        Serial.println(val);
+        delay(100);
+    }
+    
+    Serial.print("Microphone test complete. Range observed: ");
+    Serial.print(min);
+    Serial.print(" to ");
+    Serial.println(max);
+}
+
+void setup() {
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
   display.drawBitmap(0, 0, epd_bitmap_happy, 128, 64, WHITE);
   display.display();
   emojiStartTime = millis();
-}
 
-void loop() {
+  pinMode(MIC_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  Serial.begin(115200);
 
-  unsigned long currentTime = millis();
-  
-  // Check for the 30-second mark to switch to sad emoji
-  if (showingHappy && currentTime - emojiStartTime >= 30000) {
-    showingHappy = false;
-    showingSad = true;
-    emojiStartTime = currentTime;
-    display.clearDisplay();
-    display.setCursor(10, 28);  // Adjust as needed
-    display.drawBitmap(0, 0, epd_bitmap_sad, 128, 64, WHITE);
-    display.display();
+  calibrateDCBias();
+  testMicrophone();
+
+  // Initialize SD card
+  if (!SD.begin(SD_CS_PIN)) {
+      Serial.println("SD Card initialization failed!");
+      // Visual error indication
+      for (int i = 0; i < 5; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(200);
+        digitalWrite(LED_PIN, LOW);
+        delay(200);
+      }
+      return;
   }
-  
-  // Check for the 1-minute mark to switch to angry emoji
-  else if (showingSad && currentTime - emojiStartTime >= 60000) {
-    showingSad = false;
-    showingAngry = true;
-    emojiStartTime = currentTime;
-    display.clearDisplay();
-    display.setCursor(10, 28);  // Adjust as needed
-    display.drawBitmap(0, 0, epd_bitmap_angry, 128, 64, WHITE);
-    display.display();
-  }
-
-  
-    if (!isRecording && (millis() % 1000 == 0)) {
-        int micValue = analogRead(MIC_PIN);
-        Serial.print("Mic reading: ");
-        Serial.println(micValue);
-    }
-
-    bool buttonState = digitalRead(BUTTON_PIN);
-    if (buttonState == LOW && lastButtonState == HIGH && (millis() - lastDebounceTime) > debounceDelay) {
-        lastDebounceTime = millis();
-        isRecording = !isRecording;
-        
-        if (isRecording) {
-            digitalWrite(LED_PIN, HIGH);
-            totalSamples = 0;
-            if (SD.mkdir("AUDIO")) {
-                Serial.println("Created AUDIO directory");
-                } else {
-                Serial.println("Failed to create directory or already exists");
-                }
-            audioFile = SD.open("A.WAV", FILE_WRITE);
-            // audioFile = SD.open("/AUDIO/recording.wav", FILE_WRITE);
-            if (audioFile) {
-                writeWavHeader();
-            } else {
-                Serial.println("Failed to open file for writing");
-                isRecording = false;
-            }
-        } else {
-            digitalWrite(LED_PIN, LOW);
-            if (audioFile) {
-                updateWavHeader();
-                audioFile.close();
-            }
-        }
-    }
-    lastButtonState = buttonState;
-    
-    if (isRecording) {
-        unsigned long currentMicros = micros();
-        if (currentMicros - sampleTimer >= sampleInterval) {
-            sampleTimer = currentMicros;
-            int micValue = analogRead(MIC_PIN);
-            int16_t scaledValue = (micValue - 512) * 64;
-            audioFile.write((uint8_t)(scaledValue & 0xFF));
-            audioFile.write((uint8_t)((scaledValue >> 8) & 0xFF));
-            totalSamples++;
-            if (totalSamples % 100 == 0) {
-                audioFile.flush();
-            }
-            if (totalSamples % 1000 == 0) {
-                Serial.print("Samples recorded: ");
-                Serial.println(totalSamples);
-            }
-        }
-    }
+  Serial.println("SD Card ready.");
 }
 
 void writeWavHeader() {
@@ -425,16 +433,176 @@ void writeWavHeader() {
 }
 
 void updateWavHeader() {
+    // Calculate sizes for header update
     uint32_t dataSize = totalSamples * 2;
     uint32_t fileSize = dataSize + 44 - 8;
+    
+    // Update the file size fields (at position 4)
     audioFile.seek(4);
     audioFile.write((uint8_t)(fileSize & 0xFF));
     audioFile.write((uint8_t)((fileSize >> 8) & 0xFF));
     audioFile.write((uint8_t)((fileSize >> 16) & 0xFF));
     audioFile.write((uint8_t)((fileSize >> 24) & 0xFF));
+    
+    // Update the data size fields (at position 40)
     audioFile.seek(40);
     audioFile.write((uint8_t)(dataSize & 0xFF));
     audioFile.write((uint8_t)((dataSize >> 8) & 0xFF));
     audioFile.write((uint8_t)((dataSize >> 16) & 0xFF));
     audioFile.write((uint8_t)((dataSize >> 24) & 0xFF));
+    
+    // Log recording stats
+    float durationSec = (float)totalSamples / 8000.0;
+    Serial.print("Recording complete: ");
+    Serial.print(totalSamples);
+    Serial.print(" samples (");
+    Serial.print(durationSec, 2);
+    Serial.println(" seconds)");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Check for the 30-second mark to switch to sad emoji
+  if (showingHappy && currentTime - emojiStartTime >= 30000) {
+    showingHappy = false;
+    showingSad = true;
+    emojiStartTime = currentTime;
+    display.clearDisplay();
+    display.setCursor(10, 28);  // Adjust as needed
+    display.drawBitmap(0, 0, epd_bitmap_sad, 128, 64, WHITE);
+    display.display();
+  }
+  
+  // Check for the 1-minute mark to switch to angry emoji
+  else if (showingSad && currentTime - emojiStartTime >= 60000) {
+    showingSad = false;
+    showingAngry = true;
+    emojiStartTime = currentTime;
+    display.clearDisplay();
+    display.setCursor(10, 28);  // Adjust as needed
+    display.drawBitmap(0, 0, epd_bitmap_angry, 128, 64, WHITE);
+    display.display();
+  }
+
+  // Button press for toggling recording
+  bool buttonState = digitalRead(BUTTON_PIN);
+  if (buttonState == LOW && lastButtonState == HIGH && (millis() - lastDebounceTime) > debounceDelay) {
+    lastDebounceTime = millis();
+    isRecording = !isRecording;
+    
+    if (isRecording) {
+      digitalWrite(LED_PIN, HIGH);
+      totalSamples = 0;
+      
+      // Get next available file name and open it
+      String filePath = getNextAvailableFileName();
+      audioFile = SD.open(filePath.c_str(), FILE_WRITE);
+      
+      if (audioFile) {
+        Serial.print("Recording to: ");
+        Serial.println(filePath);
+        writeWavHeader();
+        
+        // Update display to show recording status
+        display.clearDisplay();
+        if (showingHappy) {
+          display.drawBitmap(0, 0, epd_bitmap_happy, 128, 64, WHITE);
+        } else if (showingSad) {
+          display.drawBitmap(0, 0, epd_bitmap_sad, 128, 64, WHITE);
+        } else if (showingAngry) {
+          display.drawBitmap(0, 0, epd_bitmap_angry, 128, 64, WHITE);
+        }
+        display.setTextSize(1);
+        display.setTextColor(WHITE);
+        display.setCursor(5, 5);
+        display.print("REC");
+        display.display();
+      } else {
+        Serial.println("Failed to open file for writing");
+        isRecording = false;
+        digitalWrite(LED_PIN, LOW);
+      }
+    } else {
+      digitalWrite(LED_PIN, LOW);
+      
+      // If recording, update header and close file
+      if (audioFile) {
+        updateWavHeader();
+        audioFile.close();
+        
+        // Update display to remove recording status
+        display.clearDisplay();
+        if (showingHappy) {
+          display.drawBitmap(0, 0, epd_bitmap_happy, 128, 64, WHITE);
+        } else if (showingSad) {
+          display.drawBitmap(0, 0, epd_bitmap_sad, 128, 64, WHITE);
+        } else if (showingAngry) {
+          display.drawBitmap(0, 0, epd_bitmap_angry, 128, 64, WHITE);
+        }
+        display.display();
+      }
+    }
+  }
+
+  lastButtonState = buttonState;
+
+  // If recording, sample audio and write to file
+  if (isRecording && audioFile) {
+    unsigned long currentMicros = micros();
+
+    if (currentMicros - sampleTimer >= sampleInterval) {
+      sampleTimer = currentMicros;
+
+      // Read mic input
+      int micValue = analogRead(MIC_PIN);
+
+      // Apply moving average filter
+      filterBuffer[filterIndex] = micValue;
+      filterIndex = (filterIndex + 1) % FILTER_SIZE;
+
+      long sum = 0;
+      for (int i = 0; i < FILTER_SIZE; i++) {
+        sum += filterBuffer[i];
+      }
+      int filteredValue = sum / FILTER_SIZE;
+
+      // Center around measured DC bias
+      int centeredValue = filteredValue - actualDCBias;
+
+      // Apply a lower noise gate
+      if (abs(centeredValue) < NOISE_THRESHOLD) {
+        centeredValue = 0;
+      }
+
+      // Scale to 16-bit with higher gain
+      int16_t scaledValue = centeredValue * 200;  // Increased gain
+
+      // Prevent clipping
+      if (scaledValue > 32767) scaledValue = 32767;
+      if (scaledValue < -32768) scaledValue = -32768;
+
+      // Write to WAV file - Little-endian format (low byte first, then high byte)
+      // This is CORRECT for WAV file format
+      audioFile.write((uint8_t)(scaledValue & 0xFF));        // Low byte
+      audioFile.write((uint8_t)((scaledValue >> 8) & 0xFF)); // High byte
+
+      // Periodic debug output
+      if (totalSamples % 1000 == 0) {
+        Serial.print("Raw: ");
+        Serial.print(micValue);
+        Serial.print(", DC-centered: ");
+        Serial.print(centeredValue);
+        Serial.print(", Scaled: ");
+        Serial.println(scaledValue);
+      }
+
+      // Flush to SD card periodically to avoid data loss
+      if (totalSamples % 4000 == 0) { // Flush once per second at 8kHz
+        audioFile.flush();
+      }
+
+      totalSamples++;
+    }
+  }
 }
