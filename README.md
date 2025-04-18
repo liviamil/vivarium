@@ -51,3 +51,12 @@ VOLT → 5V on Arduino
 ### Button & LEDs
 5V → Button → Resistor → Pin 26 on Arduino → Indicator LED → GND
 Pin 24 on Arduino → Resistor → Indicator LED 
+
+## To test
+1. Build the circuit as instructed in [this section](this section)
+2. Download this .ino file or clone this repository to your local computer
+3. Connect your Arduino Mega to your computer
+4. Upload the code to your arduino
+5. To test it, use a power source (e.g. power bank or laptop)
+6. You're ready to use vivarium! 
+
